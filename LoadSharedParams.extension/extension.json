@@ -1,0 +1,7 @@
+{
+    "type": "ui",
+    "name": "LoadSharedParams",
+    "description": "Load shared parameters from a .txt file into any Revit project",
+    "author": "conconpo",
+    "author-url": "https://github.com/conconpo"
+}
