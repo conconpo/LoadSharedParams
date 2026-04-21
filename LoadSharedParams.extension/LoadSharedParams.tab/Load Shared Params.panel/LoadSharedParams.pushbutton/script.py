@@ -59,6 +59,7 @@ def get_param_groups():
     """Return parameter group dict for current Revit version."""
     if revit_version <= 2024:
         return {
+            "IFC Parameters":   DB.BuiltInParameterGroup.PG_IFC,
             "Identity Data":    DB.BuiltInParameterGroup.PG_IDENTITY_DATA,
             "Data":             DB.BuiltInParameterGroup.PG_DATA,
             "Construction":     DB.BuiltInParameterGroup.PG_CONSTRUCTION,
@@ -70,6 +71,7 @@ def get_param_groups():
         }
     else:
         candidates = {
+            "IFC Parameters":   lambda: DB.GroupTypeId.Ifc,
             "Identity Data":    lambda: DB.GroupTypeId.IdentityData,
             "Data":             lambda: DB.GroupTypeId.Data,
             "Construction":     lambda: DB.GroupTypeId.Construction,
