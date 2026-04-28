@@ -1,338 +1,398 @@
 # -*- coding: utf-8 -*-
-"""Create Bauteilliste from loaded shared parameters.
-- Step 1: shows all Psets with their assigned categories
-- Creates one schedule per Pset per category
-- Schedule name = full Pset name + category e.g. Pset_WallCommon.Wände / Walls
-- Column headers = part after dot, suffix stripped
-- Bilingual Deutsch / English throughout
-- No "ungrouped" section — parameters without dot notation grouped by full name
+"""Load Shared Parameters — universal version.
+- Reads available categories directly from the current Revit project
+- Displays them as Deutsch / English
+- All selected groups go to all selected categories
+- Always loads into IFC-Parameter section
+- Same or individual categories per group
 Compatible with Revit 2024, 2025 and 2026.
 """
-__title__ = "Create\nBauteilliste"
+__title__ = "Load\nShared Params"
 __author__ = "conconpo"
-__doc__ = "Creates Bauteillisten from loaded shared parameters. One schedule per Pset per category."
+__doc__ = "Universal shared parameter loader. Bilingual UI (DE/EN)."
 
 from pyrevit import revit, DB, forms, script
-from collections import OrderedDict
+
+import clr
+clr.AddReference('System.Windows.Forms')
+from System.Windows.Forms import OpenFileDialog, DialogResult
 
 doc = revit.doc
 app = doc.Application
+revit_version = int(app.VersionNumber)
 
 # -----------------------------------------------------------
-#  Bilingual category reverse lookup: BuiltInCategory.Id -> label
-#  Used to display category names next to each Pset
+#  English names by OST key — used to build "DE / EN" labels.
+#  German part always comes from cat.Name (live from Revit),
+#  so it matches exactly what the user sees in the UI,
+#  regardless of Revit version or localization.
+#  e.g. Revit DE says "Geschossdecken" not "Böden" for OST_Floors.
 # -----------------------------------------------------------
-CAT_LABELS = {
-    DB.BuiltInCategory.OST_Walls:               "Wände / Walls",
-    DB.BuiltInCategory.OST_Floors:              "Böden / Floors",
-    DB.BuiltInCategory.OST_Roofs:               "Dächer / Roofs",
-    DB.BuiltInCategory.OST_Doors:               "Türen / Doors",
-    DB.BuiltInCategory.OST_Windows:             "Fenster / Windows",
-    DB.BuiltInCategory.OST_Columns:             "Stützen / Columns",
-    DB.BuiltInCategory.OST_StructuralColumns:   "Tragende Stützen / Structural Columns",
-    DB.BuiltInCategory.OST_StructuralFraming:   "Tragende Träger / Structural Framing",
-    DB.BuiltInCategory.OST_Stairs:              "Treppen / Stairs",
-    DB.BuiltInCategory.OST_Railings:            "Geländer / Railings",
-    DB.BuiltInCategory.OST_Ceilings:            "Decken / Ceilings",
-    DB.BuiltInCategory.OST_Rooms:               "Räume / Rooms",
-    DB.BuiltInCategory.OST_MEPSpaces:           "HLK-Zonen / Spaces",
-    DB.BuiltInCategory.OST_Areas:               "Flächen / Areas",
-    DB.BuiltInCategory.OST_Furniture:           "Möbel / Furniture",
-    DB.BuiltInCategory.OST_GenericModel:        "Allgemeines Modell / Generic Models",
-    DB.BuiltInCategory.OST_Casework:            "Einbauschränke / Casework",
-    DB.BuiltInCategory.OST_CurtainWallPanels:   "Vorhangfassaden-Paneele / Curtain Panels",
-    DB.BuiltInCategory.OST_MechanicalEquipment: "Mechanische Ausrüstung / Mechanical Equipment",
-    DB.BuiltInCategory.OST_PlumbingFixtures:    "Sanitärinstallationen / Plumbing Fixtures",
-    DB.BuiltInCategory.OST_ElectricalFixtures:  "Elektrische Einrichtungen / Electrical Fixtures",
-    DB.BuiltInCategory.OST_ElectricalEquipment: "Elektrische Ausrüstung / Electrical Equipment",
-    DB.BuiltInCategory.OST_LightingFixtures:    "Leuchten / Lighting Fixtures",
-    DB.BuiltInCategory.OST_PipeFitting:         "Rohrformstücke / Pipe Fittings",
-    DB.BuiltInCategory.OST_PipeAccessory:       "Rohrzubehör / Pipe Accessories",
-    DB.BuiltInCategory.OST_PipeCurves:          "Rohre / Pipes",
-    DB.BuiltInCategory.OST_DuctCurves:          "Kanäle / Ducts",
-    DB.BuiltInCategory.OST_DuctFitting:         "Kanalformstücke / Duct Fittings",
-    DB.BuiltInCategory.OST_DuctAccessory:       "Kanalzubehör / Duct Accessories",
-    DB.BuiltInCategory.OST_Sprinklers:          "Sprinkler / Sprinklers",
-    DB.BuiltInCategory.OST_StructuralFoundation:"Tragende Fundamente / Structural Foundations",
+ENGLISH = {
+    "OST_Walls":                "Walls",
+    "OST_Floors":               "Floors",
+    "OST_Roofs":                "Roofs",
+    "OST_Doors":                "Doors",
+    "OST_Windows":              "Windows",
+    "OST_Columns":              "Columns",
+    "OST_StructuralColumns":    "Structural Columns",
+    "OST_StructuralFraming":    "Structural Framing",
+    "OST_Stairs":               "Stairs",
+    "OST_Railings":             "Railings",
+    "OST_Ceilings":             "Ceilings",
+    "OST_Rooms":                "Rooms",
+    "OST_MEPSpaces":            "Spaces",
+    "OST_Areas":                "Areas",
+    "OST_Furniture":            "Furniture",
+    "OST_GenericModel":         "Generic Models",
+    "OST_Casework":             "Casework",
+    "OST_CurtainWallPanels":    "Curtain Panels",
+    "OST_MechanicalEquipment":  "Mechanical Equipment",
+    "OST_PlumbingFixtures":     "Plumbing Fixtures",
+    "OST_ElectricalFixtures":   "Electrical Fixtures",
+    "OST_ElectricalEquipment":  "Electrical Equipment",
+    "OST_LightingFixtures":     "Lighting Fixtures",
+    "OST_PipeFitting":          "Pipe Fittings",
+    "OST_PipeAccessory":        "Pipe Accessories",
+    "OST_PipeCurves":           "Pipes",
+    "OST_DuctCurves":           "Ducts",
+    "OST_DuctFitting":          "Duct Fittings",
+    "OST_DuctAccessory":        "Duct Accessories",
+    "OST_Sprinklers":           "Sprinklers",
+    "OST_StructuralFoundation": "Structural Foundations",
 }
 
-def get_cat_label(cat_obj):
-    """Return bilingual label for a category object, or its name if not in map."""
-    try:
-        for bic, label in CAT_LABELS.items():
-            bic_id = doc.Settings.Categories.get_Item(bic)
-            if bic_id and bic_id.Id == cat_obj.Id:
-                return label
-    except Exception:
-        pass
-    return cat_obj.Name
-
-def col_header(param_name):
-    """Pset_WallCommon.FireRating[Type] -> FireRating"""
-    name = param_name
-    for s in ["[Type]", "[Instance]", "[Typ]", "[Exemplar]"]:
-        if name.endswith(s):
-            name = name[:-len(s)]
-    if "." in name:
-        name = name.split(".")[-1]
-    return name.strip()
-
-def group_from_param(param_name):
-    """
-    Pset_WallCommon.FireRating[Type] -> Pset_WallCommon
-    Aussenbauteil[Type]              -> Aussenbauteil
-    Aussenbauteil                    -> Aussenbauteil
-
-    No "ungrouped" — parameters without a dot use their full name as group.
-    This means every parameter always belongs to a group.
-    """
-    name = param_name
-    for s in ["[Type]", "[Instance]", "[Typ]", "[Exemplar]"]:
-        if name.endswith(s):
-            name = name[:-len(s)]
-    if "." in name:
-        return name.rsplit(".", 1)[0]
-    # No dot — the full parameter name IS the group name
-    return name.strip()
-
-def unique_name(base_name):
-    """Return base_name if no schedule with that name exists, else append (2), (3)..."""
-    existing = set()
-    for v in DB.FilteredElementCollector(doc).OfClass(DB.ViewSchedule).ToElements():
-        existing.add(v.Name)
-    if base_name not in existing:
-        return base_name
-    n = 2
-    while "{} ({})".format(base_name, n) in existing:
-        n += 1
-    return "{} ({})".format(base_name, n)
-
-# ===========================================================
-#  STEP 1 — Read all parameters, group by Pset name
-#           Collect all categories per Pset
-# ===========================================================
-binding_map = doc.ParameterBindings
-iterator    = binding_map.ForwardIterator()
-iterator.Reset()
-
-# pset_groups: {pset_name: {"params": [(name, defn, binding)], "cats": {cat_label: cat_obj}}}
-pset_groups = OrderedDict()
-
-while iterator.MoveNext():
-    defn    = iterator.Key
-    binding = iterator.Current
-    name    = defn.Name
-    grp     = group_from_param(name)
-
-    if grp not in pset_groups:
-        pset_groups[grp] = {"params": [], "cats": OrderedDict()}
-
-    pset_groups[grp]["params"].append((name, defn, binding))
-
-    # Collect all categories this parameter is bound to
-    try:
-        for cat in binding.Categories:
-            label = get_cat_label(cat)
-            pset_groups[grp]["cats"][label] = cat
-    except Exception:
-        pass
-
-if not pset_groups:
-    forms.alert(
-        "Keine gemeinsam genutzten Parameter gefunden.\n"
-        "No shared parameters found.\n\n"
-        "Bitte zuerst Parameter laden.\n"
-        "Load parameters first.",
-        title="Keine Parameter / No Parameters",
-        exitscript=True
-    )
-
-# ===========================================================
-#  STEP 2 — Show Psets with their categories
-#  User picks which Pset+category combinations to schedule
-#
-#  Display format:
-#  "Pset_WallCommon  [Wände / Walls]  (10 Param.)"
-#
-#  If a Pset is bound to multiple categories, it appears
-#  once per category so user can pick each independently.
-# ===========================================================
-
-# Build display entries — one per Pset per category
-entry_map = {}  # display_label -> (pset_name, cat_label, cat_obj)
-
-for pset_name, data in pset_groups.items():
-    params = data["params"]
-    cats   = data["cats"]
-
-    if cats:
-        for cat_label, cat_obj in cats.items():
-            display = "{}  [{}]  ({} Param.)".format(
-                pset_name, cat_label, len(params))
-            entry_map[display] = (pset_name, cat_label, cat_obj)
+def get_ifc_param_group():
+    """Return IFC Parameters group for current Revit version."""
+    if revit_version <= 2024:
+        try:
+            return DB.BuiltInParameterGroup.PG_IFC
+        except Exception:
+            return DB.BuiltInParameterGroup.PG_IDENTITY_DATA
     else:
-        # No category detected — show without category label
-        display = "{}  [?]  ({} Param.)".format(pset_name, len(params))
-        entry_map[display] = (pset_name, None, None)
+        try:
+            return DB.GroupTypeId.Ifc
+        except Exception:
+            try:
+                return DB.GroupTypeId.IdentityData
+            except Exception:
+                try:
+                    return DB.ForgeTypeId(
+                        "autodesk.parameter.group:identityData-1.0.0")
+                except Exception:
+                    return None
+
+# -----------------------------------------------------------
+#  Read ALL bindable categories from the current project
+#  and display them with bilingual labels where known,
+#  or just the Revit name if unknown.
+# -----------------------------------------------------------
+def get_project_categories():
+    """
+    Returns a sorted list of display labels and a dict:
+    {display_label: Category object}
+    Only includes categories that allow bound parameters.
+    """
+    cat_map = {}  # display_label -> Category object
+    cats = doc.Settings.Categories
+
+    for cat in cats:
+        # Only model categories that allow parameters
+        if cat.CategoryType != DB.CategoryType.Model:
+            continue
+        if not cat.AllowsBoundParameters:
+            continue
+
+        # Build display label
+        bic_name = cat.Id.ToString()
+        # BuiltInCategory enum value is negative int — get name
+        try:
+            bic = DB.BuiltInCategory(cat.Id.IntegerValue)
+            bic_str = bic.ToString()  # e.g. "OST_Walls"
+        except Exception:
+            bic_str = ""
+
+        # German: always use cat.Name (what Revit shows in its UI)
+        # English: add from lookup if known
+        en = ENGLISH.get(bic_str, "")
+        if en:
+            label = "{} / {}".format(cat.Name, en)
+        else:
+            label = cat.Name  # custom/unknown category — show as-is
+
+        # Handle duplicate labels
+        base_label = label
+        counter = 2
+        while label in cat_map:
+            label = "{} ({})".format(base_label, counter)
+            counter += 1
+
+        cat_map[label] = cat
+
+    return cat_map
+
+# ===========================================================
+#  SCHRITT 1 / STEP 1 — Parameterdatei auswählen / Pick file
+# ===========================================================
+dialog = OpenFileDialog()
+dialog.Title = "Parameterdatei auswählen / Select Shared Parameter File (.txt)"
+dialog.Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*"
+dialog.InitialDirectory = r"C:\\"
+
+result = dialog.ShowDialog()
+if result != DialogResult.OK:
+    script.exit()
+
+spf_path = dialog.FileName
+
+# ===========================================================
+#  SCHRITT 2 / STEP 2 — Datei öffnen / Open file
+# ===========================================================
+original_spf = app.SharedParametersFilename
+app.SharedParametersFilename = spf_path
+spf = app.OpenSharedParameterFile()
+
+if spf is None:
+    app.SharedParametersFilename = original_spf
+    forms.alert(
+        "Datei konnte nicht geöffnet werden.\n"
+        "Could not open the selected file.\n\n"
+        "Bitte eine gültige Revit-Parameterdatei (.txt) auswählen.\n"
+        "Make sure it is a valid Revit shared parameter .txt file.",
+        title="Ungültige Datei / Invalid File",
+        exitscript=True)
+
+file_groups = {}
+for grp in spf.Groups:
+    defs = list(grp.Definitions)
+    if defs:
+        file_groups[grp.Name] = defs
+
+if not file_groups:
+    app.SharedParametersFilename = original_spf
+    forms.alert(
+        "Die Datei enthält keine Parameter.\n"
+        "The selected file contains no parameters.",
+        title="Leere Datei / Empty File",
+        exitscript=True)
+
+total_groups = len(file_groups)
+total_params = sum(len(d) for d in file_groups.values())
+
+# ===========================================================
+#  SCHRITT 3 / STEP 3 — Gruppen auswählen / Select groups
+# ===========================================================
+group_display_map = {}
+for gname, defs in file_groups.items():
+    display = "{} ({} Parameter)".format(gname, len(defs))
+    group_display_map[display] = gname
 
 selected_displays = forms.SelectFromList.show(
-    sorted(entry_map.keys()),
-    title="Psets für Bauteillisten auswählen / Select Psets for Bauteillisten",
+    sorted(group_display_map.keys()),
+    title="Gruppen auswählen / Select groups  —  "
+          "{} Gruppen, {} Parameter total".format(total_groups, total_params),
     multiselect=True,
-    button_name="Bauteillisten erstellen / Create Schedules"
+    button_name="Ausgewählte laden / Load Selected"
 )
-
 if not selected_displays:
+    app.SharedParametersFilename = original_spf
+    script.exit()
+
+selected_group_names = [group_display_map[d] for d in selected_displays]
+selected_param_count = sum(len(file_groups[g]) for g in selected_group_names)
+
+# ===========================================================
+#  SCHRITT 4 / STEP 4 — Kategorie-Zuweisung
+#  Read categories from project — universal, no hardcoded list
+# ===========================================================
+cat_map = get_project_categories()  # {display_label: Category object}
+
+assignment_mode = forms.CommandSwitchWindow.show(
+    [
+        "Gleiche Kategorien für alle Gruppen / Same categories for all groups",
+        "Individuelle Kategorien pro Gruppe / Individual categories per group",
+    ],
+    message="Kategorie-Zuweisung / Category assignment:"
+)
+if not assignment_mode:
+    app.SharedParametersFilename = original_spf
+    script.exit()
+
+group_cat_map = {}  # {group_name: [Category object, ...]}
+
+if "Gleiche" in assignment_mode or "Same" in assignment_mode:
+    chosen_labels = forms.SelectFromList.show(
+        sorted(cat_map.keys()),
+        title="Kategorien für alle Gruppen / Categories for all groups",
+        multiselect=True,
+        button_name="Diese Kategorien verwenden / Use These Categories"
+    )
+    if not chosen_labels:
+        app.SharedParametersFilename = original_spf
+        script.exit()
+    for gname in selected_group_names:
+        group_cat_map[gname] = [cat_map[l] for l in chosen_labels]
+
+else:
+    for gname in selected_group_names:
+        param_count = len(file_groups[gname])
+        chosen_labels = forms.SelectFromList.show(
+            sorted(cat_map.keys()),
+            title="Kategorien für / Categories for:  '{}' ({} Param.)".format(
+                gname, param_count),
+            multiselect=True,
+            button_name="Für diese Gruppe / Use for This Group"
+        )
+        if not chosen_labels:
+            group_cat_map[gname] = []
+        else:
+            group_cat_map[gname] = [cat_map[l] for l in chosen_labels]
+
+# ===========================================================
+#  SCHRITT 5 / STEP 5 — Bestätigung / Confirmation
+# ===========================================================
+summary_lines = []
+for gname in selected_group_names:
+    cats = group_cat_map.get(gname, [])
+    cat_labels = [c.Name for c in cats]
+    if cats:
+        summary_lines.append("  {} ->\n    {}".format(
+            gname, "\n    ".join(cat_labels)))
+    else:
+        summary_lines.append("  {} -> (übersprungen / skipped)".format(gname))
+
+confirmed = forms.alert(
+    "Gruppen / Groups:  {}\n"
+    "Parameter:         {}\n"
+    "Revit:             {}\n\n"
+    "Zuordnungen / Mappings:\n{}\n\n"
+    "Fortfahren? / Continue?".format(
+        len(selected_group_names),
+        selected_param_count,
+        revit_version,
+        "\n".join(summary_lines)),
+    title="Bestätigung / Confirm",
+    yes=True, no=True
+)
+if not confirmed:
+    app.SharedParametersFilename = original_spf
     script.exit()
 
 # ===========================================================
-#  STEP 3 — Type or Instance
+#  SCHRITT 6 / STEP 6 — Typ oder Exemplar / Type or Instance
 # ===========================================================
 binding_choice = forms.CommandSwitchWindow.show(
     [
         "Typ (pro Familientyp) / Type (per family type)",
         "Exemplar (pro Element) / Instance (per element)",
     ],
-    message="Parameter anzeigen als / Show parameters as:"
+    message="Parameter hinzufügen als / Add parameters as:"
 )
 if not binding_choice:
+    app.SharedParametersFilename = original_spf
     script.exit()
 
+is_instance = "Instance" in binding_choice or "Exemplar" in binding_choice
+
 # ===========================================================
-#  STEP 4 — Create one schedule per selected entry
-#           Name = full Pset name + "." + category label
+#  SCHRITT 7 / STEP 7 — IFC-Parameter (fest / fixed)
 # ===========================================================
-created   = []
-sched_ids = []
+param_group = get_ifc_param_group()
 
-for display in selected_displays:
-    pset_name, cat_label, cat_obj = entry_map[display]
-    params = pset_groups[pset_name]["params"]
+if param_group is None:
+    app.SharedParametersFilename = original_spf
+    forms.alert(
+        "IFC-Parameter-Gruppe konnte nicht aufgelöst werden.\n"
+        "Could not resolve IFC Parameters group for Revit {}.".format(revit_version),
+        title="Fehler / Error",
+        exitscript=True)
 
-    # Schedule name: Pset_WallCommon.Wände / Walls
-    if cat_label:
-        base_title = "{}.{}".format(pset_name, cat_label)
-    else:
-        base_title = pset_name
+# ===========================================================
+#  SCHRITT 8 / STEP 8 — Vorhandene Parameter ermitteln
+# ===========================================================
+existing_names = set()
+binding_map = doc.ParameterBindings
+iterator = binding_map.ForwardIterator()
+iterator.Reset()
+while iterator.MoveNext():
+    existing_names.add(iterator.Key.Name)
 
-    title  = unique_name(base_title)
-    ok_cols  = []
-    err_cols = []
+# ===========================================================
+#  SCHRITT 9 / STEP 9 — Parameter laden / Load parameters
+# ===========================================================
+spf = app.OpenSharedParameterFile()
+ok_list    = []
+skip_list  = []
+error_list = []
 
-    # Use the category from the entry, or fall back to first available
-    use_cat_id = cat_obj.Id if cat_obj else None
-
-    if use_cat_id is None:
-        err_cols.append("Keine Kategorie / No category for {}".format(pset_name))
-        created.append({"title": title, "ok": [], "err": err_cols,
-                        "headings": 0, "schedule": None})
-        continue
-
-    # --- TX 1: create schedule and add fields ---
-    with revit.Transaction("Erstelle / Create {}".format(title)):
-        schedule  = DB.ViewSchedule.CreateSchedule(doc, use_cat_id)
-        schedule.Name = title
-        sched_def = schedule.Definition
-
-        try:
-            sched_def.IsItemized = True
-        except Exception:
-            pass
-
-        avail_fields = sched_def.GetSchedulableFields()
-        field_lookup = {}
-        for sf in avail_fields:
-            try:
-                field_lookup[sf.GetName(doc)] = sf
-            except Exception:
-                pass
-
-        for param_name, defn, binding in params:
-            header = col_header(param_name)
-            sf = field_lookup.get(param_name) or field_lookup.get(header)
-
-            if sf is None:
-                for f in avail_fields:
-                    try:
-                        if f.GetName(doc) in (param_name, header):
-                            sf = f
-                            break
-                    except Exception:
-                        pass
-
-            if sf is None:
-                err_cols.append(param_name)
-                continue
-
-            try:
-                sched_def.AddField(sf)
-                ok_cols.append(param_name)
-            except Exception as e:
-                err_cols.append("{} ({})".format(param_name, str(e)))
-
-        sched_ids.append((schedule.Id, title, ok_cols, err_cols))
-
-# --- TX 2: set column headings by index on fresh objects ---
-with revit.Transaction("Spaltenköpfe setzen / Set Column Headings"):
-    for sched_id, title, ok_cols, err_cols in sched_ids:
-        fresh_sched = doc.GetElement(sched_id)
-        if fresh_sched is None:
+with revit.Transaction("Gemeinsam genutzte Parameter laden / Load Shared Parameters"):
+    for grp in spf.Groups:
+        if grp.Name not in selected_group_names:
             continue
 
-        fresh_def   = fresh_sched.Definition
-        field_count = fresh_def.GetFieldCount()
-        exp_headers = [col_header(n) for n in ok_cols]
-        set_count   = 0
+        cat_objects = group_cat_map.get(grp.Name, [])
+        if not cat_objects:
+            continue
 
-        for idx in range(min(field_count, len(exp_headers))):
+        cat_set = app.Create.NewCategorySet()
+        for cat in cat_objects:
             try:
-                field = fresh_def.GetField(idx)
-                field.ColumnHeading = exp_headers[idx]
-                set_count += 1
-            except Exception:
-                pass
+                cat_set.Insert(cat)
+            except Exception as e:
+                print("WARNUNG / WARNING {}: {}".format(cat.Name, e))
 
-        created.append({
-            "title":    title,
-            "ok":       ok_cols,
-            "err":      err_cols,
-            "headings": set_count,
-            "schedule": fresh_sched,
-        })
+        if is_instance:
+            binding = app.Create.NewInstanceBinding(cat_set)
+        else:
+            binding = app.Create.NewTypeBinding(cat_set)
 
-# ===========================================================
-#  STEP 5 — Open last created schedule
-# ===========================================================
-if created:
-    for item in reversed(created):
-        if item["schedule"] is not None:
+        for defn in grp.Definitions:
+            name = defn.Name
+            if name in existing_names:
+                skip_list.append("{} [{}]".format(name, grp.Name))
+                continue
             try:
-                revit.uidoc.ActiveView = item["schedule"]
-            except Exception:
-                pass
-            break
+                doc.ParameterBindings.Insert(defn, binding, param_group)
+                ok_list.append("{} [{}]".format(name, grp.Name))
+            except Exception as e:
+                error_list.append("{} - {}".format(name, str(e)))
 
 # ===========================================================
-#  STEP 6 — Results
+#  SCHRITT 10 / STEP 10 — Originalpfad wiederherstellen
+# ===========================================================
+app.SharedParametersFilename = original_spf
+
+# ===========================================================
+#  SCHRITT 11 / STEP 11 — Ergebnis / Results
 # ===========================================================
 output = script.get_output()
-output.set_title("Bauteillisten erstellt / Bauteillisten Created")
+output.set_title("Parameter laden / Load Shared Params (Revit {})".format(revit_version))
 output.print_html("<h2>Ergebnis / Results</h2>")
+output.print_html("<p>Datei / File: <b>{}</b></p>".format(spf_path))
+output.print_html("<p>Revit: <b>{}</b> | Bindung / Binding: <b>{}</b> | "
+                  "Gruppe / Group: <b>IFC-Parameter / IFC Parameters</b></p>".format(
+    revit_version,
+    "Exemplar / Instance" if is_instance else "Typ / Type"))
 
-for item in created:
-    output.print_html("<h3>{}</h3>".format(item["title"]))
-    output.print_html(
-        "<p style='color:green'>Spalten / Columns: {} | "
-        "Köpfe gesetzt / Headings set: {}</p>".format(
-            len(item["ok"]), item["headings"]))
-    for c in item["ok"]:
-        output.print_html(
-            "<p style='color:green'>&#10003; {} → {}</p>".format(
-                c, col_header(c)))
-    if item["err"]:
-        output.print_html(
-            "<p style='color:orange'>Nicht hinzugefügt / Not added: {}</p>".format(
-                len(item["err"])))
-        for c in item["err"]:
-            output.print_html(
-                "<p style='color:orange'>&#8594; {}</p>".format(c))
+output.print_html("<h3>Kategorie-Zuordnungen / Category mappings:</h3>")
+for gname in selected_group_names:
+    cats = group_cat_map.get(gname, [])
+    cat_labels = [c.Name for c in cats] if cats else ["(übersprungen / skipped)"]
+    output.print_html("<p><b>{}</b> -> {}</p>".format(
+        gname, ", ".join(cat_labels)))
+
+output.print_html("<h3 style='color:green'>Geladen / Loaded: {}</h3>".format(
+    len(ok_list)))
+for n in ok_list:
+    output.print_html("<p style='color:green'>&#10003; {}</p>".format(n))
+
+output.print_html(
+    "<h3 style='color:orange'>Übersprungen / Skipped: {}</h3>".format(len(skip_list)))
+for n in skip_list:
+    output.print_html("<p style='color:orange'>&#8594; {}</p>".format(n))
+
+if error_list:
+    output.print_html("<h3 style='color:red'>Fehler / Errors: {}</h3>".format(
+        len(error_list)))
+    for n in error_list:
+        output.print_html("<p style='color:red'>&#10007; {}</p>".format(n))
