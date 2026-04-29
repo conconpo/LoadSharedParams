@@ -4,7 +4,6 @@
 - Creates one schedule per Pset per category
 - Schedule name = full Pset name + category e.g. Pset_WallCommon.Wände / Walls
 - Column headers = part after dot, suffix stripped
-- Bilingual Deutsch / English throughout
 - No "ungrouped" section — parameters without dot notation grouped by full name
 Compatible with Revit 2024, 2025 and 2026.
 """
@@ -186,17 +185,76 @@ if not selected_displays:
     script.exit()
 
 # ===========================================================
-#  STEP 3 — Type or Instance
+#  STEP 3 — Skip binding choice & Create Schedules
 # ===========================================================
-binding_choice = forms.CommandSwitchWindow.show(
-    [
-        "Typ (pro Familientyp) / Type (per family type)",
-        "Exemplar (pro Element) / Instance (per element)",
-    ],
-    message="Parameter anzeigen als / Show parameters as:"
-)
-if not binding_choice:
-    script.exit()
+
+# We removed the CommandSwitchWindow here to stop the popup.
+
+created   = []
+sched_ids = []
+
+for display in selected_displays:
+    pset_name, cat_label, cat_obj = entry_map[display]
+    params = pset_groups[pset_name]["params"]
+
+    # 1. Get the raw Revit Category name
+    if cat_obj:
+        raw_cat_name = cat_obj.Name
+        # 2. Clean the name: Revit prohibits { } [ ] : ; | ? or /
+        invalid_chars = r'{}[]:;|?/'
+        clean_cat_name = "".join(c for c in raw_cat_name if c not in invalid_chars)
+        
+        # 3. Apply your naming convention: Pset.RvtCategory
+        base_title = "{}.Rvt{}".format(pset_name, clean_cat_name)
+    else:
+        base_title = pset_name
+
+    title = unique_name(base_title)
+    ok_cols = []
+    err_cols = []
+    use_cat_id = cat_obj.Id if cat_obj else None
+
+    if use_cat_id is None:
+        continue
+
+    # --- TX 1: create schedule and add fields ---
+    try:
+        with revit.Transaction("Create {}".format(title)):
+            schedule = DB.ViewSchedule.CreateSchedule(doc, use_cat_id)
+            schedule.Name = title
+            sched_def = schedule.Definition
+            
+            try:
+                sched_def.IsItemized = True
+            except:
+                pass
+
+            avail_fields = sched_def.GetSchedulableFields()
+            field_lookup = {}
+            for sf in avail_fields:
+                try:
+                    field_lookup[sf.GetName(doc)] = sf
+                except:
+                    pass
+
+            for param_name, defn, binding in params:
+                header = col_header(param_name)
+                # Try to match the full parameter name or the stripped header
+                sf = field_lookup.get(param_name) or field_lookup.get(header)
+
+                if sf:
+                    try:
+                        sched_def.AddField(sf)
+                        ok_cols.append(param_name)
+                    except:
+                        err_cols.append(param_name)
+                else:
+                    err_cols.append(param_name)
+
+            sched_ids.append((schedule.Id, title, ok_cols, err_cols))
+            
+    except Exception as e:
+        print("Error creating {}: {}".format(title, str(e)))
 
 # ===========================================================
 #  STEP 4 — Create one schedule per selected entry
@@ -209,10 +267,13 @@ for display in selected_displays:
     pset_name, cat_label, cat_obj = entry_map[display]
     params = pset_groups[pset_name]["params"]
 
-    # Schedule name: Pset_WallCommon.Wände / Walls
-    if cat_label:
-        base_title = "{}.{}".format(pset_name, cat_label)
+    # Schedule name logic: Pset_Common.RvtWände
+    if cat_obj:
+        # Get the actual Revit category name and prefix it with 'Rvt'
+        category_rvt_name = "Rvt" + cat_obj.Name
+        base_title = "{}.{}".format(pset_name, category_rvt_name)
     else:
+        # Fallback if no category is detected
         base_title = pset_name
 
     title  = unique_name(base_title)
