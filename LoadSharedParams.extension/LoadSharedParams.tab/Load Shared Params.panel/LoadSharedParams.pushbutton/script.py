@@ -21,46 +21,9 @@ doc = revit.doc
 app = doc.Application
 revit_version = int(app.VersionNumber)
 
-# -----------------------------------------------------------
-#  English names by OST key — used to build "DE / EN" labels.
-#  German part always comes from cat.Name (live from Revit),
-#  so it matches exactly what the user sees in the UI,
-#  regardless of Revit version or localization.
-#  e.g. Revit DE says "Geschossdecken" not "Böden" for OST_Floors.
-# -----------------------------------------------------------
-ENGLISH = {
-    "OST_Walls":                "Walls",
-    "OST_Floors":               "Floors",
-    "OST_Roofs":                "Roofs",
-    "OST_Doors":                "Doors",
-    "OST_Windows":              "Windows",
-    "OST_Columns":              "Columns",
-    "OST_StructuralColumns":    "Structural Columns",
-    "OST_StructuralFraming":    "Structural Framing",
-    "OST_Stairs":               "Stairs",
-    "OST_Railings":             "Railings",
-    "OST_Ceilings":             "Ceilings",
-    "OST_Rooms":                "Rooms",
-    "OST_MEPSpaces":            "Spaces",
-    "OST_Areas":                "Areas",
-    "OST_Furniture":            "Furniture",
-    "OST_GenericModel":         "Generic Models",
-    "OST_Casework":             "Casework",
-    "OST_CurtainWallPanels":    "Curtain Panels",
-    "OST_MechanicalEquipment":  "Mechanical Equipment",
-    "OST_PlumbingFixtures":     "Plumbing Fixtures",
-    "OST_ElectricalFixtures":   "Electrical Fixtures",
-    "OST_ElectricalEquipment":  "Electrical Equipment",
-    "OST_LightingFixtures":     "Lighting Fixtures",
-    "OST_PipeFitting":          "Pipe Fittings",
-    "OST_PipeAccessory":        "Pipe Accessories",
-    "OST_PipeCurves":           "Pipes",
-    "OST_DuctCurves":           "Ducts",
-    "OST_DuctFitting":          "Duct Fittings",
-    "OST_DuctAccessory":        "Duct Accessories",
-    "OST_Sprinklers":           "Sprinklers",
-    "OST_StructuralFoundation": "Structural Foundations",
-}
+# Categories are read live from the Revit project (doc.Settings.Categories)
+# and displayed using cat.Name — the exact name Revit shows in its UI.
+# No translation needed.
 
 def get_ifc_param_group():
     """Return IFC Parameters group for current Revit version."""
@@ -112,13 +75,9 @@ def get_project_categories():
         except Exception:
             bic_str = ""
 
-        # German: always use cat.Name (what Revit shows in its UI)
-        # English: add from lookup if known
-        en = ENGLISH.get(bic_str, "")
-        if en:
-            label = "{} / {}".format(cat.Name, en)
-        else:
-            label = cat.Name  # custom/unknown category — show as-is
+        # Use cat.Name exactly as Revit shows it in the UI
+        # No English translation needed — Revit name is authoritative
+        label = cat.Name
 
         # Handle duplicate labels
         base_label = label
