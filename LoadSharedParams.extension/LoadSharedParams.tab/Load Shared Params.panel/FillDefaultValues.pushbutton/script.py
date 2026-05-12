@@ -8,37 +8,120 @@ DEFAULT VALUES PER TYPE:
            Temperature, Volume...)
   INTEGER (non-YESNO)              -> 999
 
-DESIGN DECISIONS:
-  DOUBLE -> 0.0, not 999:
-    Dimensional doubles (Area, Length, Volume, Temperature...) are stored
-    in Revit internal units (ft², ft, ft³, Kelvin offset...).  Converting
-    999 to internal units requires knowing the spec type and project display
-    unit for every param -- fragile, unit-system-dependent, and wrong for
-    "calculated" params where a formula already drives the value.
-    0.0 is always 0 in every unit system.  It is the universal sentinel for
-    "not yet user-set" for dimensional params, and avoids all unit math.
-
-  YESNO empty-check: HasValue == False
-    HasValue becomes True after the first param.Set() call.  A second run
-    therefore correctly sees "already set" and skips it (idempotent).
-
-  DOUBLE/INTEGER empty-check: AsDouble()==0.0 / AsInteger()==0
-    Revit initialises storage slots to 0/0.0.  A non-zero value means
-    someone (user, script, formula) already set it -> skip.
+FLOW:
+  1. Read ParameterBindings -> group params by Pset/Mset prefix
+  2. Show SelectFromList -> user picks which Psets to fill
+  3. Show scope selector -> Active View / Selection / Whole Model
+  4. Collect elements from categories bound to SELECTED params only
+  5. Process instances + their unique types
+  6. Fill empty params, report results
 
 Compatible with Revit 2021 - 2026.
 """
 __title__ = "Fill\nDefaults"
 __author__ = "conconpo"
-__doc__ = "Fills empty IFC shared parameter values: YESNO=False, TEXT=UNSET, Double=0, Int=999."
+__doc__ = "Fill empty IFC/Pset parameter values with defaults. Select which Psets to fill first."
 
+from collections import OrderedDict
 from pyrevit import revit, DB, forms, script
 
 doc   = revit.doc
 uidoc = revit.uidoc
 
+# Spatial categories need a different collector
+SPATIAL_BICS = {
+    int(DB.BuiltInCategory.OST_Rooms),
+    int(DB.BuiltInCategory.OST_MEPSpaces),
+    int(DB.BuiltInCategory.OST_Areas),
+}
+
 # ---------------------------------------------------------------------------
-#  STEP 1 -- Scope selector
+#  HELPERS -- grouping (same logic as Create Bauteilliste)
+# ---------------------------------------------------------------------------
+def _group_from_param(param_name):
+    """
+    Pset_WallCommon.FireRating  -> Pset_WallCommon
+    Mset_SpaceStamp.NetArea     -> Mset_SpaceStamp
+    Aussenbauteil               -> Aussenbauteil   (no dot -> whole name is group)
+    Strips trailing [Type] / [Instance] suffixes first.
+    """
+    name = param_name
+    for suffix in ["[Type]", "[Instance]", "[Typ]", "[Exemplar]"]:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    if "." in name:
+        return name.rsplit(".", 1)[0]
+    return name.strip()
+
+
+# ---------------------------------------------------------------------------
+#  STEP 1 -- Read ALL ParameterBindings and group by Pset/Mset
+# ---------------------------------------------------------------------------
+# pset_groups: { group_name -> { "param_names": set(), "cat_ids": set() } }
+pset_groups = OrderedDict()
+
+binding_map = doc.ParameterBindings
+it = binding_map.ForwardIterator()
+it.Reset()
+while it.MoveNext():
+    try:
+        defn    = it.Key
+        name    = defn.Name
+        binding = it.Current
+        grp     = _group_from_param(name)
+
+        if grp not in pset_groups:
+            pset_groups[grp] = {"param_names": set(), "cat_ids": set()}
+
+        pset_groups[grp]["param_names"].add(name)
+
+        if hasattr(binding, "Categories"):
+            for cat in binding.Categories:
+                pset_groups[grp]["cat_ids"].add(cat.Id)
+    except Exception:
+        pass
+
+if not pset_groups:
+    forms.alert(
+        "No project parameters found.\nLoad shared parameters first.",
+        title="No Parameters", exitscript=True
+    )
+
+# ---------------------------------------------------------------------------
+#  STEP 2 -- Let user pick which Psets/Msets to fill
+#            Format: "Pset_WallCommon   (8 params)"
+# ---------------------------------------------------------------------------
+display_to_group = OrderedDict()   # display string -> group name
+
+for grp, data in sorted(pset_groups.items()):
+    n = len(data["param_names"])
+    display = "{}   ({} param{})".format(grp, n, "s" if n != 1 else "")
+    display_to_group[display] = grp
+
+selected_displays = forms.SelectFromList.show(
+    sorted(display_to_group.keys()),
+    title="Select Psets / Msets to fill   --   {} available".format(len(display_to_group)),
+    multiselect=True,
+    button_name="Fill Selected"
+)
+
+if not selected_displays:
+    script.exit()
+
+# Resolve selected display strings back to group names and build:
+#   selected_param_names : set of param names to fill
+#   selected_cat_ids     : set of category ElementIds to collect from
+selected_param_names = set()
+selected_cat_ids     = set()
+
+for disp in selected_displays:
+    grp  = display_to_group[disp]
+    data = pset_groups[grp]
+    selected_param_names.update(data["param_names"])
+    selected_cat_ids.update(data["cat_ids"])
+
+# ---------------------------------------------------------------------------
+#  STEP 3 -- Scope selector
 # ---------------------------------------------------------------------------
 scope_choice = forms.CommandSwitchWindow.show(
     [
@@ -52,53 +135,17 @@ if not scope_choice:
     script.exit()
 
 # ---------------------------------------------------------------------------
-#  STEP 2 -- Read ParameterBindings
-#            (a) all parameter names bound to this project
-#            (b) all category IDs those parameters are bound to
-# ---------------------------------------------------------------------------
-project_param_names = set()
-bound_category_ids  = set()
-
-# Spatial elements need a different collector (rooms, MEP spaces, areas)
-SPATIAL_BICS = {
-    int(DB.BuiltInCategory.OST_Rooms),
-    int(DB.BuiltInCategory.OST_MEPSpaces),
-    int(DB.BuiltInCategory.OST_Areas),
-}
-
-binding_map = doc.ParameterBindings
-it = binding_map.ForwardIterator()
-it.Reset()
-while it.MoveNext():
-    try:
-        project_param_names.add(it.Key.Name)
-        binding = it.Current
-        if hasattr(binding, "Categories"):
-            for cat in binding.Categories:
-                bound_category_ids.add(cat.Id)
-    except Exception:
-        pass
-
-if not project_param_names:
-    forms.alert(
-        "No project parameters found.\nLoad shared parameters first.",
-        title="No Parameters", exitscript=True
-    )
-
-has_spatial = bool(
-    bound_category_ids and
-    any(cid.IntegerValue in SPATIAL_BICS for cid in bound_category_ids)
-)
-
-# ---------------------------------------------------------------------------
-#  STEP 3 -- Collect instances
+#  STEP 4 -- Collect instances
 #
-#  Normal elements : OfCategoryId per bound non-spatial category (view-aware)
-#  Spatial elements: SpatialElementFilter (always whole-model, then scoped)
-#    Reason: OfCategoryId returns 0 for rooms in 3D/section views
+#  Use selected_cat_ids (only categories relevant to chosen Psets).
+#  Normal elements  : OfCategoryId per non-spatial category
+#  Spatial elements : SpatialElementFilter (rooms / MEP spaces / areas)
 # ---------------------------------------------------------------------------
+has_spatial = any(cid.IntegerValue in SPATIAL_BICS for cid in selected_cat_ids)
+
+
 def _collect_normal(view_id=None):
-    normal_ids = [cid for cid in bound_category_ids
+    normal_ids = [cid for cid in selected_cat_ids
                   if cid.IntegerValue not in SPATIAL_BICS]
     results = []
     for cat_id in normal_ids:
@@ -124,8 +171,9 @@ def _collect_spatial():
                  .WherePasses(DB.SpatialElementFilter())
                  .WhereElementIsNotElementType())
         return [e for e in col
-                if e and e.Category and e.Category.Id.IntegerValue in SPATIAL_BICS
-                and e.Category.Id in bound_category_ids]
+                if e and e.Category
+                and e.Category.Id.IntegerValue in SPATIAL_BICS
+                and e.Category.Id in selected_cat_ids]
     except Exception:
         results = []
         for bic in [DB.BuiltInCategory.OST_Rooms,
@@ -133,7 +181,7 @@ def _collect_spatial():
                     DB.BuiltInCategory.OST_Areas]:
             try:
                 cid = DB.ElementId(bic)
-                if cid in bound_category_ids:
+                if cid in selected_cat_ids:
                     results.extend(list(
                         DB.FilteredElementCollector(doc)
                           .OfCategoryId(cid)
@@ -145,10 +193,9 @@ def _collect_spatial():
 
 
 if "Active View" in scope_choice:
-    vid     = doc.ActiveView.Id
-    normal  = _collect_normal(view_id=vid)
+    vid         = doc.ActiveView.Id
+    normal      = _collect_normal(view_id=vid)
     spatial_all = _collect_spatial()
-    # Scope spatial to the view's level when possible
     try:
         lvl_id  = doc.ActiveView.GenLevel.Id
         spatial = [e for e in spatial_all
@@ -163,7 +210,7 @@ elif "Selection" in scope_choice:
         forms.alert("Nothing is selected.", title="No Selection", exitscript=True)
     all_sel   = [doc.GetElement(eid) for eid in sel_ids]
     instances = [e for e in all_sel
-                 if e and e.Category and e.Category.Id in bound_category_ids]
+                 if e and e.Category and e.Category.Id in selected_cat_ids]
     if not instances:
         instances = [e for e in all_sel if e]
 
@@ -172,14 +219,13 @@ else:  # Whole Model
 
 if not instances:
     forms.alert(
-        "No elements found in the relevant categories.\n"
-        "Bound categories: {}  |  Spatial: {}".format(
-            len(bound_category_ids), has_spatial),
+        "No elements found for the selected Psets and scope.\n"
+        "Selected categories: {}".format(len(selected_cat_ids)),
         exitscript=True
     )
 
 # ---------------------------------------------------------------------------
-#  STEP 4 -- Unique TYPE elements (type-bound params live on the type)
+#  STEP 5 -- Unique TYPE elements (type-bound params live on the type)
 # ---------------------------------------------------------------------------
 type_ids_seen = set()
 type_elements = []
@@ -197,17 +243,12 @@ for inst in instances:
 all_targets = list(instances) + list(type_elements)
 
 # ---------------------------------------------------------------------------
-#  HELPERS
+#  HELPERS -- emptiness and default value
 # ---------------------------------------------------------------------------
 def _should_process(param):
-    """True for any param from our project binding set."""
+    """True only if this param belongs to the user-selected Psets."""
     try:
-        if param.IsShared:
-            return True
-    except Exception:
-        pass
-    try:
-        if param.Definition.Name in project_param_names:
+        if param.Definition.Name in selected_param_names:
             return True
     except Exception:
         pass
@@ -215,7 +256,6 @@ def _should_process(param):
 
 
 def _is_yesno(param):
-    """True when the parameter is a Yes/No boolean type."""
     try:
         if hasattr(param.Definition, "GetDataType"):        # Revit 2025+
             ft = param.Definition.GetDataType()
@@ -231,16 +271,10 @@ def _needs_default(param):
     """
     Returns (write, storage_type, value, skip_reason).
 
-    STRING  -> "UNSET"  when AsString() is None or ""
-    YESNO   -> 0        when HasValue is False  (idempotent: Set() flips HasValue)
-    DOUBLE  -> 0.0      when AsDouble() == 0.0  (universal, no unit conversion needed)
+    STRING  -> "UNSET"  when null/empty
+    YESNO   -> 0        when HasValue is False
+    DOUBLE  -> 0.0      when AsDouble() == 0.0
     INTEGER -> 999      when AsInteger() == 0
-
-    Why DOUBLE -> 0 instead of 999:
-      Dimensional params store values in internal units (ft², ft, ft³...).
-      0.0 internal = 0.0 in any display unit.  No conversion needed.
-      It correctly signals "not reviewed" for calculated params too,
-      since any formula-driven value will be non-zero and thus skipped.
     """
     if param.IsReadOnly:
         return False, None, None, "read-only"
@@ -265,7 +299,7 @@ def _needs_default(param):
 
         elif st == DB.StorageType.Double:
             if param.AsDouble() == 0.0:
-                return True, st, 0.0, None     # write 0.0 -- universal, no unit math
+                return True, st, 0.0, None
             return False, None, None, "has value"
 
     except Exception as ex:
@@ -275,7 +309,7 @@ def _needs_default(param):
 
 
 # ---------------------------------------------------------------------------
-#  STEP 5 -- Fill
+#  STEP 6 -- Fill
 # ---------------------------------------------------------------------------
 filled_count   = 0
 skipped_count  = 0
@@ -312,7 +346,7 @@ with revit.Transaction("Fill Default Parameter Values"):
                 elif st == DB.StorageType.String:
                     param.Set(str(val))
                 elif st == DB.StorageType.Double:
-                    param.Set(float(val))      # 0.0 -- no unit conversion needed
+                    param.Set(float(val))
 
                 filled_count += 1
 
@@ -327,23 +361,31 @@ with revit.Transaction("Fill Default Parameter Values"):
                 )
 
 # ---------------------------------------------------------------------------
-#  STEP 6 -- Report
+#  STEP 7 -- Report
 # ---------------------------------------------------------------------------
 n_spatial = len([e for e in instances
-                 if e and e.Category and e.Category.Id.IntegerValue in SPATIAL_BICS])
+                 if e and e.Category
+                 and e.Category.Id.IntegerValue in SPATIAL_BICS])
 n_normal  = len(instances) - n_spatial
+
+selected_group_names = sorted(
+    display_to_group[d] for d in selected_displays
+)
 
 output = script.get_output()
 output.set_title("Fill Default Values -- Results")
+output.print_html("<h2>Fill Default Parameter Values</h2>")
 output.print_html(
-    "<h2>Fill Default Parameter Values</h2>"
     "<p><b>Scope:</b> {}</p>"
-    "<p><b>Normal instances processed:</b> {}</p>"
-    "<p><b>Spatial elements (rooms/spaces/areas):</b> {}</p>"
-    "<p><b>Unique types processed:</b> {}</p>"
-    "<p><b>Project parameters targeted:</b> {}</p>".format(
-        scope_choice, n_normal, n_spatial,
-        len(type_elements), len(project_param_names)
+    "<p><b>Psets filled:</b> {}</p>"
+    "<p><b>Parameters targeted:</b> {}</p>"
+    "<p><b>Normal instances:</b> {}  |  "
+    "<b>Spatial elements:</b> {}  |  "
+    "<b>Unique types:</b> {}</p>".format(
+        scope_choice,
+        ", ".join(selected_group_names),
+        len(selected_param_names),
+        n_normal, n_spatial, len(type_elements)
     )
 )
 output.print_html("<h3 style='color:green'>Filled: {}</h3>".format(filled_count))
