@@ -7,7 +7,7 @@
 - Handles special categories (Rooms, Areas, Spaces)
 Compatible with Revit 2024, 2025 and 2026.
 """
-__title__ = "Create\nBauteilliste"
+__title__ = "Create\nSchedule"
 __author__ = "conconpo"
 __doc__ = "Creates Bauteillisten from loaded shared parameters."
 
