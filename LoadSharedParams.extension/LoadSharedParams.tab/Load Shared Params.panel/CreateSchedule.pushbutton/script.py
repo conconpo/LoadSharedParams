@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """Create Bauteilliste from loaded shared parameters.
 - Shows all Psets with their assigned categories
-- Creates one schedule per selected Pset+category combination
-- Schedule name: Pset_WallCommon.RvtWände
-- Column headers: part after dot, suffix stripped (FireRating not Pset_WallCommon.FireRating[Type])
+- For each selected Pset+category, scans elements for every unique combination
+  of ("Typ in IFC exportieren als"  x  "Typ Vordefinierter IFC-Typ") values
+- Creates ONE schedule per unique combination
+- Schedule name: Pset_WallCommon.RvtWände.<TypVordefinierterIFCTyp value>
+- Each schedule is filtered to show only its combination (schedule filters)
+- The 3 IFC fields are added but hidden in every schedule
+- Column headers: part after dot, suffix stripped
 - Handles special categories (Rooms, Areas, Spaces)
 Compatible with Revit 2024, 2025 and 2026.
 """
@@ -16,6 +20,21 @@ from collections import OrderedDict
 
 doc = revit.doc
 app = doc.Application
+
+# -----------------------------------------------------------
+#  IFC field display names (German primary, English fallbacks)
+# -----------------------------------------------------------
+IFC_EXPORT_AS   = ("Typ in IFC exportieren als",
+                   ["Type Export to IFC As", "Export to IFC As (Type)", "Export as (Type)"])
+IFC_EXPORT_FILE = ("IfcObjectType[Type]",
+                   ["IfcObjectType", "Ifc Object Type", "IFC Object Type"])
+IFC_PREDEF_TYPE = ("Typ Vordefinierter IFC-Typ",
+                   ["Type Predefined IFC Type", "Predefined IFC Type (Type)", "Predefined Type (Type)"])
+
+IFC_FIELD_NAMES = [IFC_EXPORT_AS, IFC_EXPORT_FILE, IFC_PREDEF_TYPE]
+
+# Fallback suffix when IFC-Typ value is empty
+FALLBACK_IFC_SUFFIX = "OhneTyp"
 
 # -----------------------------------------------------------
 #  Helpers
@@ -31,8 +50,7 @@ def col_header(param_name):
     return name.strip()
 
 def group_from_param(param_name):
-    """Pset_WallCommon.FireRating[Type] -> Pset_WallCommon
-       Aussenbauteil[Type]              -> Aussenbauteil"""
+    """Pset_WallCommon.FireRating[Type] -> Pset_WallCommon"""
     name = param_name
     for s in ["[Type]", "[Instance]", "[Typ]", "[Exemplar]"]:
         if name.endswith(s):
@@ -42,11 +60,11 @@ def group_from_param(param_name):
     return name.strip()
 
 def unique_name(base_name):
-    """Pset_WallCommon.RvtWände -> append (2),(3) if already exists."""
-    existing = set()
-    for v in DB.FilteredElementCollector(doc)\
-              .OfClass(DB.ViewSchedule).ToElements():
-        existing.add(v.Name)
+    """Append (2),(3)... if view name already exists."""
+    existing = set(
+        v.Name for v in DB.FilteredElementCollector(doc)
+                           .OfClass(DB.ViewSchedule).ToElements()
+    )
     if base_name not in existing:
         return base_name
     n = 2
@@ -60,11 +78,7 @@ def clean_for_name(text):
     return "".join(c for c in text if c not in invalid)
 
 def create_schedule_for_cat(cat_obj):
-    """
-    Create a ViewSchedule for the given category.
-    Handles special cases: Rooms, Areas, Spaces.
-    Returns the schedule or raises an exception.
-    """
+    """Create a ViewSchedule; handles Areas specially."""
     try:
         bic = DB.BuiltInCategory(cat_obj.Id.IntegerValue)
     except Exception:
@@ -76,17 +90,98 @@ def create_schedule_for_cat(cat_obj):
         if not area_schemes:
             raise Exception("Kein Flächenschema / No area scheme found")
         return DB.ViewSchedule.CreateAreaSchedule(doc, area_schemes[0].Id)
-    else:
-        return DB.ViewSchedule.CreateSchedule(doc, cat_obj.Id)
+    return DB.ViewSchedule.CreateSchedule(doc, cat_obj.Id)
+
+def find_schedulable_field(avail_fields, primary_name, fallbacks):
+    """Find a schedulable field by display name (case-insensitive)."""
+    lookup = {}
+    for sf in avail_fields:
+        try:
+            lookup[sf.GetName(doc).lower()] = sf
+        except Exception:
+            pass
+    for name in [primary_name] + list(fallbacks):
+        match = lookup.get(name.lower())
+        if match is not None:
+            return match
+    return None
+
+def _read_param(p):
+    """Extract string value from a Parameter object."""
+    try:
+        st = p.StorageType
+        if st == DB.StorageType.String:
+            return (p.AsString() or "").strip()
+        if st == DB.StorageType.Integer:
+            return str(p.AsInteger())
+        if st == DB.StorageType.Double:
+            return str(p.AsDouble())
+        if st == DB.StorageType.ElementId:
+            eid = p.AsElementId()
+            if eid != DB.ElementId.InvalidElementId:
+                e = doc.GetElement(eid)
+                if e is not None and hasattr(e, "Name"):
+                    return (e.Name or "").strip()
+    except Exception:
+        pass
+    return ""
+
+def get_param_value(element, param_names):
+    """
+    Read a parameter value from an element (instance then type).
+    param_names: list of display names to try.
+    Returns string or "".
+    """
+    for name in param_names:
+        p = element.LookupParameter(name)
+        if p is not None:
+            val = _read_param(p)
+            if val != "":
+                return val
+    type_id = element.GetTypeId()
+    if type_id and type_id != DB.ElementId.InvalidElementId:
+        elem_type = doc.GetElement(type_id)
+        if elem_type is not None:
+            for name in param_names:
+                p = elem_type.LookupParameter(name)
+                if p is not None:
+                    val = _read_param(p)
+                    if val != "":
+                        return val
+    return ""
+
+def collect_ifc_pairs(cat_obj):
+    """
+    Scan all (non-type) elements of cat_obj and return a sorted list of unique
+    (ifc_export_as_value, ifc_predef_type_value) tuples.
+    Falls back to [("", "")] so at least one schedule is always created.
+    """
+    export_as_names = [IFC_EXPORT_AS[0]] + list(IFC_EXPORT_AS[1])
+    predef_names    = [IFC_PREDEF_TYPE[0]] + list(IFC_PREDEF_TYPE[1])
+
+    pairs = set()
+    try:
+        collector = DB.FilteredElementCollector(doc)\
+                      .OfCategoryId(cat_obj.Id)\
+                      .WhereElementIsNotElementType()
+        for elem in collector:
+            val_export = get_param_value(elem, export_as_names)
+            val_predef = get_param_value(elem, predef_names)
+            pairs.add((val_export, val_predef))
+    except Exception:
+        pass
+
+    if not pairs:
+        pairs.add(("", ""))
+    return sorted(pairs)
 
 # ===========================================================
-#  STEP 1 — Read all parameters from project, group by Pset
+#  STEP 1 — Read all shared parameters, group by Pset
 # ===========================================================
 binding_map = doc.ParameterBindings
 iterator    = binding_map.ForwardIterator()
 iterator.Reset()
 
-# {pset_name: {"params": [(name, defn, binding)], "cats": {cat_name: cat_obj}}}
 pset_groups = OrderedDict()
 
 while iterator.MoveNext():
@@ -115,10 +210,9 @@ if not pset_groups:
         exitscript=True)
 
 # ===========================================================
-#  STEP 2 — Build display list: one entry per Pset per category
-#  Format: "Pset_WallCommon  [Wände]  (10 Param.)"
+#  STEP 2 — Selection dialog
 # ===========================================================
-entry_map = {}  # display -> (pset_name, cat_name, cat_obj)
+entry_map = {}
 
 for pset_name, data in pset_groups.items():
     params = data["params"]
@@ -143,33 +237,68 @@ if not selected_displays:
     script.exit()
 
 # ===========================================================
-#  STEP 3 — Create one schedule per selected entry
-#           TX 1: create + add fields
-#           TX 2: set column headings by index
+#  STEP 3 — Expand selections into (cat, pset, params, pair) tuples
 # ===========================================================
-sched_ids = []  # (ElementId, title, ok_cols, err_cols)
-created   = []
+sched_queue = []   # list of dicts, one per schedule to create
 
-# --- TX 1: create all schedules and add fields ---
 for display in selected_displays:
     pset_name, cat_name, cat_obj = entry_map[display]
     params = pset_groups[pset_name]["params"]
 
-    # Schedule name: Pset_WallCommon.RvtWände
-    if cat_obj:
-        clean = clean_for_name(cat_obj.Name)
-        base_title = "{}.Rvt{}".format(pset_name, clean)
-    else:
-        base_title = pset_name
+    if cat_obj is None:
+        # No category — still record an error entry
+        sched_queue.append({
+            "cat_obj":       None,
+            "pset_name":     pset_name,
+            "params":        params,
+            "base_cat_title": pset_name,
+            "val_export":    "",
+            "val_predef":    "",
+        })
+        continue
 
-    title    = unique_name(base_title)
-    ok_cols  = []
-    err_cols = []
+    clean_cat      = clean_for_name(cat_obj.Name)
+    base_cat_title = "{}.Rvt{}".format(pset_name, clean_cat)
+
+    pairs = collect_ifc_pairs(cat_obj)
+
+    for (val_export, val_predef) in pairs:
+        sched_queue.append({
+            "cat_obj":        cat_obj,
+            "pset_name":      pset_name,
+            "params":         params,
+            "base_cat_title": base_cat_title,
+            "val_export":     val_export,
+            "val_predef":     val_predef,
+        })
+
+# ===========================================================
+#  TX 1 — Create each schedule and add fields
+# ===========================================================
+sched_ids = []   # carry data from TX1 to TX2
+created   = []
+
+for q in sched_queue:
+    cat_obj        = q["cat_obj"]
+    params         = q["params"]
+    base_cat_title = q["base_cat_title"]
+    val_export     = q["val_export"]
+    val_predef     = q["val_predef"]
+    ok_cols        = []
+    err_cols       = []
+
+    # Build schedule name: base.SuffixFromIFCTypValue
+    suffix     = clean_for_name(val_predef.strip()) if val_predef.strip() \
+                 else FALLBACK_IFC_SUFFIX
+    base_title = "{}.{}".format(base_cat_title, suffix)
+    title      = unique_name(base_title)
 
     if cat_obj is None:
         err_cols.append("Keine Kategorie / No category")
         created.append({"title": title, "ok": [], "err": err_cols,
-                        "headings": 0, "schedule": None})
+                        "headings": 0, "schedule": None,
+                        "ifc_added": [], "val_export": val_export,
+                        "val_predef": val_predef})
         continue
 
     with revit.Transaction("Erstelle / Create {}".format(title)):
@@ -178,7 +307,9 @@ for display in selected_displays:
         except Exception as e:
             err_cols.append("Kategorie-Fehler / Category error: {}".format(str(e)))
             created.append({"title": title, "ok": [], "err": err_cols,
-                            "headings": 0, "schedule": None})
+                            "headings": 0, "schedule": None,
+                            "ifc_added": [], "val_export": val_export,
+                            "val_predef": val_predef})
             continue
 
         schedule.Name = title
@@ -189,6 +320,7 @@ for display in selected_displays:
             pass
 
         avail_fields = schedule.Definition.GetSchedulableFields()
+
         field_lookup = {}
         for sf in avail_fields:
             try:
@@ -196,6 +328,7 @@ for display in selected_displays:
             except Exception:
                 pass
 
+        # Add Pset fields
         for param_name, defn, binding in params:
             header = col_header(param_name)
             sf = field_lookup.get(param_name) or field_lookup.get(header)
@@ -219,33 +352,105 @@ for display in selected_displays:
             except Exception as e:
                 err_cols.append("{} ({})".format(param_name, str(e)))
 
-        sched_ids.append((schedule.Id, title, ok_cols, err_cols))
+        # Add IFC fields
+        ifc_added = []
+        for primary, fallbacks in IFC_FIELD_NAMES:
+            sf = find_schedulable_field(avail_fields, primary, fallbacks)
+            if sf is None:
+                err_cols.append(
+                    "IFC-Feld nicht gefunden / IFC field not found: {}".format(primary))
+                ifc_added.append((primary, None))
+                continue
+            try:
+                added = schedule.Definition.AddField(sf)
+                ifc_added.append((primary, added.FieldId))
+            except Exception as e:
+                err_cols.append(
+                    "IFC-Feld Fehler / IFC field error: {} ({})".format(primary, str(e)))
+                ifc_added.append((primary, None))
 
-# --- TX 2: set column headings by index on fresh objects ---
-with revit.Transaction("Spaltenköpfe / Set Headings"):
-    for sched_id, title, ok_cols, err_cols in sched_ids:
-        fresh = doc.GetElement(sched_id)
+        sched_ids.append({
+            "id":         schedule.Id,
+            "title":      title,
+            "ok_cols":    ok_cols,
+            "err_cols":   err_cols,
+            "ifc_added":  ifc_added,
+            "val_export": val_export,
+            "val_predef": val_predef,
+        })
+
+# ===========================================================
+#  TX 2 — Column headings + hide IFC fields + schedule filters
+# ===========================================================
+with revit.Transaction("Spaltenköpfe / Headings + IFC Filters"):
+    for item in sched_ids:
+        fresh = doc.GetElement(item["id"])
         if fresh is None:
             continue
 
-        fresh_def   = fresh.Definition
-        field_count = fresh_def.GetFieldCount()
-        headers     = [col_header(n) for n in ok_cols]
-        set_count   = 0
+        fresh_def  = fresh.Definition
+        ok_cols    = item["ok_cols"]
+        err_cols   = item["err_cols"]
+        ifc_added  = item["ifc_added"]
+        val_export = item["val_export"]
+        val_predef = item["val_predef"]
 
-        for idx in range(min(field_count, len(headers))):
+        # Column headings for Pset fields
+        headers   = [col_header(n) for n in ok_cols]
+        set_count = 0
+        for idx in range(min(len(ok_cols), fresh_def.GetFieldCount())):
             try:
                 fresh_def.GetField(idx).ColumnHeading = headers[idx]
                 set_count += 1
             except Exception:
                 pass
 
+        # Hide all 3 IFC fields and build fid map
+        ifc_fid_map = {}
+        for primary, fid in ifc_added:
+            if fid is None:
+                continue
+            ifc_fid_map[primary] = fid
+            try:
+                fresh_def.GetField(fid).IsHidden = True
+            except Exception as e:
+                err_cols.append("IFC hide error: {} ({})".format(primary, str(e)))
+
+        # Add schedule filters:
+        #   "Typ in IFC exportieren als"  == val_export
+        #   "Typ Vordefinierter IFC-Typ"  == val_predef
+        filter_specs = [
+            (IFC_EXPORT_AS[0],   val_export),
+            (IFC_PREDEF_TYPE[0], val_predef),
+        ]
+        for primary_name, filter_value in filter_specs:
+            fid = ifc_fid_map.get(primary_name)
+            if fid is None:
+                err_cols.append(
+                    "Filter-Feld fehlt / Filter field missing: {}".format(primary_name))
+                continue
+            try:
+                if filter_value == "":
+                    sched_filter = DB.ScheduleFilter(
+                        fid, DB.ScheduleFilterType.HasNoValue)
+                else:
+                    sched_filter = DB.ScheduleFilter(
+                        fid, DB.ScheduleFilterType.Equal, filter_value)
+                fresh_def.AddFilter(sched_filter)
+            except Exception as e:
+                err_cols.append(
+                    "Filter-Fehler / Filter error: {} = '{}' ({})".format(
+                        primary_name, filter_value, str(e)))
+
         created.append({
-            "title":    title,
-            "ok":       ok_cols,
-            "err":      err_cols,
-            "headings": set_count,
-            "schedule": fresh,
+            "title":      item["title"],
+            "ok":         ok_cols,
+            "err":        err_cols,
+            "headings":   set_count,
+            "schedule":   fresh,
+            "ifc_added":  ifc_added,
+            "val_export": val_export,
+            "val_predef": val_predef,
         })
 
 # ===========================================================
@@ -270,16 +475,38 @@ output.print_html("<h2>Ergebnis / Results</h2>")
 for item in created:
     output.print_html("<h3>{}</h3>".format(item["title"]))
     output.print_html(
+        "<p style='color:#555'>"
+        "Filter: <b>Typ in IFC exportieren als</b> = '{}' &nbsp;|&nbsp; "
+        "<b>Typ Vordefinierter IFC-Typ</b> = '{}'</p>".format(
+            item["val_export"] or "(leer/empty)",
+            item["val_predef"] or "(leer/empty)"
+        )
+    )
+    output.print_html(
         "<p style='color:green'>Spalten / Columns: {} | "
         "Köpfe / Headings: {}</p>".format(
             len(item["ok"]), item.get("headings", 0)))
     for c in item["ok"]:
         output.print_html(
-            "<p style='color:green'>&#10003; {} → {}</p>".format(
+            "<p style='color:green'>&#10003; {} &rarr; {}</p>".format(
                 c, col_header(c)))
+
+    ifc_added = item.get("ifc_added", [])
+    if ifc_added:
+        output.print_html(
+            "<p style='color:blue'><b>IFC-Felder (versteckt / hidden):</b></p>")
+        for primary, fid in ifc_added:
+            if fid is not None:
+                output.print_html(
+                    "<p style='color:blue'>&#10003; {}</p>".format(primary))
+            else:
+                output.print_html(
+                    "<p style='color:orange'>&#8594; {} &mdash; "
+                    "nicht gefunden / not found</p>".format(primary))
+
     if item["err"]:
         output.print_html(
-            "<p style='color:orange'>Nicht hinzugefügt / Not added: {}</p>".format(
+            "<p style='color:orange'>Warnungen / Warnings: {}</p>".format(
                 len(item["err"])))
         for c in item["err"]:
             output.print_html(
