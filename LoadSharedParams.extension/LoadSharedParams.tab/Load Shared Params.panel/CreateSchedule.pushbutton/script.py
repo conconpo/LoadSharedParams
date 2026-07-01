@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """Create Bauteilliste from loaded shared parameters.
 - Shows all Psets with their assigned categories
-- For each selected Pset+category, scans elements for every unique combination
-  of ("Typ in IFC exportieren als"  x  "Typ Vordefinierter IFC-Typ") values
-- Creates ONE schedule per unique combination
-- Schedule name: Pset_WallCommon.RvtWände.<TypVordefinierterIFCTyp value>
-- Each schedule is filtered to show only its combination (schedule filters)
-- The 3 IFC fields are added but hidden in every schedule
+- For each selected Pset+category, scans elements for every unique value of
+  "Typ in IFC exportieren als"
+- Creates ONE schedule per unique value
+- Schedule name: Pset_WallCommon.RvtWände.<TypInIFCExportierenAls value>
+- Each schedule is filtered to show only that value (schedule filter)
+- The IFC field "Typ in IFC exportieren als" is added but hidden in every schedule
 - Column headers: part after dot, suffix stripped
 - Handles special categories (Rooms, Areas, Spaces)
 Compatible with Revit 2024, 2025 and 2026.
@@ -26,12 +26,8 @@ app = doc.Application
 # -----------------------------------------------------------
 IFC_EXPORT_AS   = ("Typ in IFC exportieren als",
                    ["Type Export to IFC As", "Export to IFC As (Type)", "Export as (Type)"])
-IFC_EXPORT_FILE = ("IfcObjectType[Type]",
-                   ["IfcObjectType", "Ifc Object Type", "IFC Object Type"])
-IFC_PREDEF_TYPE = ("Typ Vordefinierter IFC-Typ",
-                   ["Type Predefined IFC Type", "Predefined IFC Type (Type)", "Predefined Type (Type)"])
 
-IFC_FIELD_NAMES = [IFC_EXPORT_AS, IFC_EXPORT_FILE, IFC_PREDEF_TYPE]
+IFC_FIELD_NAMES = [IFC_EXPORT_AS]
 
 # Fallback suffix when IFC-Typ value is empty
 FALLBACK_IFC_SUFFIX = "OhneTyp"
@@ -150,30 +146,27 @@ def get_param_value(element, param_names):
                         return val
     return ""
 
-def collect_ifc_pairs(cat_obj):
+def collect_ifc_export_values(cat_obj):
     """
     Scan all (non-type) elements of cat_obj and return a sorted list of unique
-    (ifc_export_as_value, ifc_predef_type_value) tuples.
-    Falls back to [("", "")] so at least one schedule is always created.
+    "Typ in IFC exportieren als" values.
+    Falls back to [""] so at least one schedule is always created.
     """
     export_as_names = [IFC_EXPORT_AS[0]] + list(IFC_EXPORT_AS[1])
-    predef_names    = [IFC_PREDEF_TYPE[0]] + list(IFC_PREDEF_TYPE[1])
 
-    pairs = set()
+    values = set()
     try:
         collector = DB.FilteredElementCollector(doc)\
                       .OfCategoryId(cat_obj.Id)\
                       .WhereElementIsNotElementType()
         for elem in collector:
-            val_export = get_param_value(elem, export_as_names)
-            val_predef = get_param_value(elem, predef_names)
-            pairs.add((val_export, val_predef))
+            values.add(get_param_value(elem, export_as_names))
     except Exception:
         pass
 
-    if not pairs:
-        pairs.add(("", ""))
-    return sorted(pairs)
+    if not values:
+        values.add("")
+    return sorted(values)
 
 # ===========================================================
 #  STEP 1 — Read all shared parameters, group by Pset
@@ -253,23 +246,21 @@ for display in selected_displays:
             "params":        params,
             "base_cat_title": pset_name,
             "val_export":    "",
-            "val_predef":    "",
         })
         continue
 
     clean_cat      = clean_for_name(cat_obj.Name)
     base_cat_title = "{}.Rvt{}".format(pset_name, clean_cat)
 
-    pairs = collect_ifc_pairs(cat_obj)
+    values = collect_ifc_export_values(cat_obj)
 
-    for (val_export, val_predef) in pairs:
+    for val_export in values:
         sched_queue.append({
             "cat_obj":        cat_obj,
             "pset_name":      pset_name,
             "params":         params,
             "base_cat_title": base_cat_title,
             "val_export":     val_export,
-            "val_predef":     val_predef,
         })
 
 # ===========================================================
@@ -283,12 +274,11 @@ for q in sched_queue:
     params         = q["params"]
     base_cat_title = q["base_cat_title"]
     val_export     = q["val_export"]
-    val_predef     = q["val_predef"]
     ok_cols        = []
     err_cols       = []
 
-    # Build schedule name: base.SuffixFromIFCTypValue
-    suffix     = clean_for_name(val_predef.strip()) if val_predef.strip() \
+    # Build schedule name: base.SuffixFromIFCExportAsValue
+    suffix     = clean_for_name(val_export.strip()) if val_export.strip() \
                  else FALLBACK_IFC_SUFFIX
     base_title = "{}.{}".format(base_cat_title, suffix)
     title      = unique_name(base_title)
@@ -297,8 +287,7 @@ for q in sched_queue:
         err_cols.append("Keine Kategorie / No category")
         created.append({"title": title, "ok": [], "err": err_cols,
                         "headings": 0, "schedule": None,
-                        "ifc_added": [], "val_export": val_export,
-                        "val_predef": val_predef})
+                        "ifc_added": [], "val_export": val_export})
         continue
 
     with revit.Transaction("Erstelle / Create {}".format(title)):
@@ -308,8 +297,7 @@ for q in sched_queue:
             err_cols.append("Kategorie-Fehler / Category error: {}".format(str(e)))
             created.append({"title": title, "ok": [], "err": err_cols,
                             "headings": 0, "schedule": None,
-                            "ifc_added": [], "val_export": val_export,
-                            "val_predef": val_predef})
+                            "ifc_added": [], "val_export": val_export})
             continue
 
         schedule.Name = title
@@ -376,7 +364,6 @@ for q in sched_queue:
             "err_cols":   err_cols,
             "ifc_added":  ifc_added,
             "val_export": val_export,
-            "val_predef": val_predef,
         })
 
 # ===========================================================
@@ -393,7 +380,6 @@ with revit.Transaction("Spaltenköpfe / Headings + IFC Filters"):
         err_cols   = item["err_cols"]
         ifc_added  = item["ifc_added"]
         val_export = item["val_export"]
-        val_predef = item["val_predef"]
 
         # Column headings for Pset fields
         headers   = [col_header(n) for n in ok_cols]
@@ -416,31 +402,25 @@ with revit.Transaction("Spaltenköpfe / Headings + IFC Filters"):
             except Exception as e:
                 err_cols.append("IFC hide error: {} ({})".format(primary, str(e)))
 
-        # Add schedule filters:
+        # Add schedule filter:
         #   "Typ in IFC exportieren als"  == val_export
-        #   "Typ Vordefinierter IFC-Typ"  == val_predef
-        filter_specs = [
-            (IFC_EXPORT_AS[0],   val_export),
-            (IFC_PREDEF_TYPE[0], val_predef),
-        ]
-        for primary_name, filter_value in filter_specs:
-            fid = ifc_fid_map.get(primary_name)
-            if fid is None:
-                err_cols.append(
-                    "Filter-Feld fehlt / Filter field missing: {}".format(primary_name))
-                continue
+        fid = ifc_fid_map.get(IFC_EXPORT_AS[0])
+        if fid is None:
+            err_cols.append(
+                "Filter-Feld fehlt / Filter field missing: {}".format(IFC_EXPORT_AS[0]))
+        else:
             try:
-                if filter_value == "":
+                if val_export == "":
                     sched_filter = DB.ScheduleFilter(
                         fid, DB.ScheduleFilterType.HasNoValue)
                 else:
                     sched_filter = DB.ScheduleFilter(
-                        fid, DB.ScheduleFilterType.Equal, filter_value)
+                        fid, DB.ScheduleFilterType.Equal, val_export)
                 fresh_def.AddFilter(sched_filter)
             except Exception as e:
                 err_cols.append(
                     "Filter-Fehler / Filter error: {} = '{}' ({})".format(
-                        primary_name, filter_value, str(e)))
+                        IFC_EXPORT_AS[0], val_export, str(e)))
 
         created.append({
             "title":      item["title"],
@@ -450,7 +430,6 @@ with revit.Transaction("Spaltenköpfe / Headings + IFC Filters"):
             "schedule":   fresh,
             "ifc_added":  ifc_added,
             "val_export": val_export,
-            "val_predef": val_predef,
         })
 
 # ===========================================================
@@ -476,10 +455,8 @@ for item in created:
     output.print_html("<h3>{}</h3>".format(item["title"]))
     output.print_html(
         "<p style='color:#555'>"
-        "Filter: <b>Typ in IFC exportieren als</b> = '{}' &nbsp;|&nbsp; "
-        "<b>Typ Vordefinierter IFC-Typ</b> = '{}'</p>".format(
-            item["val_export"] or "(leer/empty)",
-            item["val_predef"] or "(leer/empty)"
+        "Filter: <b>Typ in IFC exportieren als</b> = '{}'</p>".format(
+            item["val_export"] or "(leer/empty)"
         )
     )
     output.print_html(
