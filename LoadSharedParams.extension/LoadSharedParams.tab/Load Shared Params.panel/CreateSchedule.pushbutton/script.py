@@ -25,7 +25,8 @@ app = doc.Application
 #  IFC field display names (German primary, English fallbacks)
 # -----------------------------------------------------------
 IFC_EXPORT_AS   = ("Typ in IFC exportieren als",
-                   ["Type Export to IFC As", "Export to IFC As (Type)", "Export as (Type)"])
+                   ["Export Type to IFC As", "Type Export to IFC As",
+                    "Export to IFC As (Type)", "Export as (Type)"])
 
 IFC_FIELD_NAMES = [IFC_EXPORT_AS]
 
@@ -88,16 +89,21 @@ def create_schedule_for_cat(cat_obj):
         return DB.ViewSchedule.CreateAreaSchedule(doc, area_schemes[0].Id)
     return DB.ViewSchedule.CreateSchedule(doc, cat_obj.Id)
 
+def _norm(s):
+    """Normalize a display name for robust comparison across languages/
+    Revit versions: trim, collapse internal whitespace, lowercase."""
+    return " ".join((s or "").split()).strip().lower()
+
 def find_schedulable_field(avail_fields, primary_name, fallbacks):
-    """Find a schedulable field by display name (case-insensitive)."""
+    """Find a schedulable field by display name (whitespace/case-insensitive)."""
     lookup = {}
     for sf in avail_fields:
         try:
-            lookup[sf.GetName(doc).lower()] = sf
+            lookup[_norm(sf.GetName(doc))] = sf
         except Exception:
             pass
     for name in [primary_name] + list(fallbacks):
-        match = lookup.get(name.lower())
+        match = lookup.get(_norm(name))
         if match is not None:
             return match
     return None
@@ -122,19 +128,39 @@ def _read_param(p):
         pass
     return ""
 
+def _find_param_normalized(element, norm_targets):
+    """Scan an element's actual parameters and match by normalized name.
+    More robust than LookupParameter (exact match) against stray
+    whitespace / minor casing differences between Revit language packs."""
+    try:
+        for p in element.Parameters:
+            try:
+                if _norm(p.Definition.Name) in norm_targets:
+                    val = _read_param(p)
+                    if val != "":
+                        return val
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
 def get_param_value(element, param_names):
     """
     Read a parameter value from an element (instance then type).
     param_names: list of display names to try.
     Returns string or "".
     """
+    # Fast path: exact-name LookupParameter (instance, then type)
     for name in param_names:
         p = element.LookupParameter(name)
         if p is not None:
             val = _read_param(p)
             if val != "":
                 return val
+
     type_id = element.GetTypeId()
+    elem_type = None
     if type_id and type_id != DB.ElementId.InvalidElementId:
         elem_type = doc.GetElement(type_id)
         if elem_type is not None:
@@ -144,6 +170,17 @@ def get_param_value(element, param_names):
                     val = _read_param(p)
                     if val != "":
                         return val
+
+    # Robust fallback: normalized scan (catches stray whitespace / casing
+    # differences that a strict LookupParameter name match would miss)
+    norm_targets = set(_norm(n) for n in param_names)
+    val = _find_param_normalized(element, norm_targets)
+    if val != "":
+        return val
+    if elem_type is not None:
+        val = _find_param_normalized(elem_type, norm_targets)
+        if val != "":
+            return val
     return ""
 
 def collect_ifc_export_values(cat_obj):
@@ -345,8 +382,21 @@ for q in sched_queue:
         for primary, fallbacks in IFC_FIELD_NAMES:
             sf = find_schedulable_field(avail_fields, primary, fallbacks)
             if sf is None:
-                err_cols.append(
-                    "IFC-Feld nicht gefunden / IFC field not found: {}".format(primary))
+                # Diagnostics: show near-miss field names so the real
+                # available name is visible instead of just "not found"
+                candidates = []
+                for f in avail_fields:
+                    try:
+                        fname = f.GetName(doc)
+                    except Exception:
+                        continue
+                    low = fname.lower()
+                    if "export" in low or "ifc" in low:
+                        candidates.append(fname)
+                msg = "IFC-Feld nicht gefunden / IFC field not found: {}".format(primary)
+                if candidates:
+                    msg += "  |  Verfügbar / Available: {}".format(", ".join(candidates))
+                err_cols.append(msg)
                 ifc_added.append((primary, None))
                 continue
             try:
@@ -449,6 +499,9 @@ if created:
 # ===========================================================
 output = script.get_output()
 output.set_title("Bauteillisten erstellt / Created")
+output.print_html(
+    "<p style='background:#222;color:#0f0;padding:4px 8px;font-family:monospace'>"
+    "SKRIPT-VERSION / SCRIPT VERSION: 2026-07-06-v3 (EN/DE-Fix + Diagnose)</p>")
 output.print_html("<h2>Ergebnis / Results</h2>")
 
 for item in created:
